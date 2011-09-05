@@ -23,7 +23,7 @@ use base qw(Class::Accessor);
 use Config::Augeas qw(get count_match print);
 use Config::IniFiles;
 
-our $VERSION = '0.102';
+our $VERSION = '0.103';
 
 sub new {
    my $class = shift;
@@ -143,6 +143,13 @@ sub set_aug_file {
    $aug->defvar('file', "/files$absfile");
    $aug->load;
 
+   my $err_lens_path = "/augeas/load/$lens/error";
+   my $err_lens = $aug->get($err_lens_path);
+   if ($err_lens) {
+      print STDERR "E: Failed to load lens $lens\n";
+      print STDERR $aug->print($err_lens_path);
+   }
+
    my $err_path = "/augeas/files$absfile/error";
    my $err = $aug->get($err_path);
    if ($err) {
@@ -228,9 +235,9 @@ __END__
    use Config::Augeas::Validator;
 
    # Initialize
-   my $validator = Config::Augeas::Validator->new(conf => $conffile);
+   my $validator = Config::Augeas::Validator->new(rulesdir => $rulesdir);
 
-   $validator->play_all(@files);
+   $validator->play(@files);
    exit $validator->{err};
 
 
