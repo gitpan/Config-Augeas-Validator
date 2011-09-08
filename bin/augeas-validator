@@ -1,4 +1,7 @@
 #!/usr/bin/perl -w
+
+eval 'exec /usr/bin/perl -w -S $0 ${1+"$@"}'
+    if 0; # not running under some shell
 #    Copyright (c) 2011 Raphaël Pinson.
 #
 #    This library is free software; you can redistribute it and/or
@@ -30,31 +33,52 @@ use Config::Augeas::Validator;
 my $conffile;
 my $rulesdir = "/etc/augeas-validator/rules.d";
 my $verbose = 0;
+my $debug = 0;
+my $quiet = 0;
+my $recurse = 0;
+my $exclude = '';
+my $nofail = 0;
 my $man = 0;
 my $help = 0;
 
 my $opts = GetOptions(
    'help|?'     => \$help,
    'man'        => \$man,
-   "verbose"    => \$verbose,,
+   "verbose"    => \$verbose,
+   "debug"      => \$debug,
+   "quiet"      => \$quiet,
    "conf=s"     => \$conffile,
    "rulesdir=s" => \$rulesdir,
+   "recursive"  => \$recurse,
+   "exclude=s"  => \$exclude,
+   "nofail"     => \$nofail,
 ) or pod2usage(2);
 pod2usage(1) if $help;
 pod2usage(-exitstatus => 0, -verbose => 2) if $man;
 
+
 my @files = @ARGV;
-
-
 
 my $validator;
 
 if ($conffile) {
-   $validator = Config::Augeas::Validator->new(conf => $conffile);
+   $validator = Config::Augeas::Validator->new(conf => $conffile,
+                                               recurse => $recurse,
+                                               exclude => $exclude,
+                                               nofail  => $nofail,
+                                               verbose => $verbose,
+                                               debug   => $debug,
+                                               quiet   => $quiet);
    $validator->play(@files);
    exit $validator->{err};
 } else {
-   $validator = Config::Augeas::Validator->new(rulesdir => $rulesdir);
+   $validator = Config::Augeas::Validator->new(rulesdir => $rulesdir,
+                                               recurse => $recurse,
+                                               exclude => $exclude,
+                                               nofail  => $nofail,
+                                               verbose => $verbose,
+                                               debug   => $debug,
+                                               quiet   => $quiet);
    $validator->play(@files);
    exit $validator->{err};
 }
@@ -74,8 +98,11 @@ __END__
       -help brief help message
       -man full documentation
       -verbose be verbose
-      -conf <conffile> specify which configuration file to use
       -rulesdir <rules directory> specify a directory of rules to use
+      -conf <conffile> specify which configuration file to use
+      -recursive recursively analyze the given directories
+      -nofail do not stop when errors are found
+      -exclude <pattern> exclude files by pattern
 
 =head1 OPTIONS
 
@@ -102,6 +129,18 @@ Specify the rules directory to use.
 Specify a configuration file to use. When this option is specified, the rules
 directory is bypassed, and only the given configuration file is used.
 Patterns and excludes are ignored.
+
+=item B<-recursive>
+
+Analyze the given directories recursively and test each file found.
+
+=item B<-nofail>
+
+Do not stop when errors are found on a file.
+
+=item B<-exclude pattern>
+
+A Perl regex pattern to exclude files.
 
 =back
 

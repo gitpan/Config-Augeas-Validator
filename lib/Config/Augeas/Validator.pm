@@ -22,8 +22,9 @@ use warnings;
 use base qw(Class::Accessor);
 use Config::Augeas qw(get count_match print);
 use Config::IniFiles;
+use File::Find;
 
-our $VERSION = '0.103';
+our $VERSION = '1.000';
 
 sub new {
    my $class = shift;
@@ -33,10 +34,30 @@ sub new {
 
    $self->{conffile} = $options{conf};
    $self->{rulesdir} = $options{rulesdir};
+   $self->{rulesdir} ||= "/etc/augeas-validator/rules.d";
+
+   $self->{verbose} = $options{verbose};
+   $self->{debug} = $options{debug};
+   $self->{quiet} = $options{quiet};
+   $self->{verbose} = 1 if $self->{debug};
+
+   $self->{recurse} = $options{recurse};
+
+   $self->{nofail} = $options{nofail};
+
+   $self->{exclude} = $options{exclude};
+
+   # Init hourglass
+   $self->{tick} = 0;
 
    unless ($self->{conffile}) {
       assert_notempty('rulesdir', $self->{rulesdir});
    }
+
+   $self->{aug} = Config::Augeas->new( "no_load" => 1 );
+
+   # Instantiate general error
+   $self->{err} = 0;
 
    return $self;
 }
@@ -44,8 +65,10 @@ sub new {
 sub load_conf {
    my ($self, $conffile) = @_;
 
+   $self->debug_msg("Loading rule file $conffile");
+
    $self->{cfg} = new Config::IniFiles( -file => $conffile );
-   die "E: Section 'DEFAULT' does not exist in $conffile\n"
+   die "E:[$conffile]: Section 'DEFAULT' does not exist.\n"
       unless $self->{cfg}->SectionExists('DEFAULT');
 }
 
@@ -56,7 +79,6 @@ sub init_augeas {
    # Initialize Augeas
    $self->{lens} = $self->{cfg}->val('DEFAULT', 'lens');
    assert_notempty('lens', $self->{lens});
-   $self->{aug} = Config::Augeas->new( "no_load" => 1 );
    $self->{aug}->rm("/augeas/load/*[label() != \"$self->{lens}\"]");
 }
 
@@ -67,53 +89,88 @@ sub play_one {
    @{$self->{rules}} = split(/,\s*/,
                        $self->{cfg}->val('DEFAULT', 'rules'));
 
-   # Instantiate general error
-   $self->{err} = 0;
-
    # Get return error code
    $self->{err_code} = $self->{cfg}->val('DEFAULT', 'err_code') || 1;
 
    $self->init_augeas;
 
    for my $file (@files) {
-      die "E: No such file $file\n" unless (-e $file);
+      unless (-e $file) {
+         $self->die_msg("No such file $file");
+      }
+      $self->verbose_msg("Parsing file $file");
       $self->set_aug_file($file);
       for my $rule (@{$self->{rules}}) {
+         $self->verbose_msg("Applying rule $rule to $file");
          $self->play_rule($rule, $file);
       }
    }
 }
 
 sub filter_files {
-   my ($files, $pattern, $exclude) = @_;
+   my ($self, $files) = @_;
+
+   my $pattern = $self->{cfg}->val('DEFAULT', 'pattern');
+   my $exclude = $self->{cfg}->val('DEFAULT', 'exclude');
+   $exclude ||= '^$';
 
    my @filtered_files;
    foreach my $file (@$files) {
-      if ($file =~ /^$pattern$/ && $file !~ /^$exclude$/) {
-         push @filtered_files, $file;
-      }
+      push @filtered_files, $file
+         if ($file =~ /^$pattern$/ && $file !~ /^$exclude$/);
    }
 
    return \@filtered_files;
 }
 
+sub tick {
+   my ($self) = @_;
+
+   $self->{tick}++;
+   my $tick = $self->{tick} % 4;
+
+   my $hourglass; 
+   print "\r";
+    
+   $hourglass = "|"  if ( $tick == 0 ); 
+   $hourglass = "/"  if ( $tick == 1 ); 
+   $hourglass = "-"  if ( $tick == 2 ); 
+   $hourglass = "\\" if ( $tick == 3 ); 
+
+   print "I: Recursively analyzing directories $hourglass\r";
+}
+
 sub play {
-   my ($self, @files) = @_;
+   my ($self, @infiles) = @_;
+
+   my @files;
+   if ($self->{recurse}) {
+      find sub {
+         my $exclude = $self->{exclude};
+         $exclude ||= '^$';
+         push @files, $File::Find::name
+            if(-e && $File::Find::name !~ /^$exclude$/);
+         $self->tick unless $self->{quiet}
+         }, @infiles;
+      print "\n" unless $self->{quiet};
+   } else {
+      @files = @infiles;
+   }
+   
    if ($self->{conffile}) {
       $self->load_conf($self->{conffile});
       $self->play_one(@files);
    } else {
       my $rulesdir = $self->{rulesdir};
-      opendir (RULESDIR, $rulesdir) or die "E: Could not open rules directory: $!\n";
+      opendir (RULESDIR, $rulesdir)
+         or die "E: Could not open rules directory $rulesdir: $!\n";
       while (my $conffile = readdir(RULESDIR)) {
          next unless ($conffile =~ /.*\.ini$/);
-         $self->load_conf("$rulesdir/$conffile");
+         $self->{conffile} = "$rulesdir/$conffile";
+         $self->load_conf($self->{conffile});
          next unless ($self->{cfg}->val('DEFAULT', 'pattern'));
-         my $pattern = $self->{cfg}->val('DEFAULT', 'pattern');
-         my $exclude = $self->{cfg}->val('DEFAULT', 'exclude');
-         $exclude ||= '^$';
    
-         my $filtered_files = filter_files(\@files, $pattern, $exclude);
+         my $filtered_files = $self->filter_files(\@files);
          my $elems = @$filtered_files;
          next unless ($elems > 0);
    
@@ -146,24 +203,83 @@ sub set_aug_file {
    my $err_lens_path = "/augeas/load/$lens/error";
    my $err_lens = $aug->get($err_lens_path);
    if ($err_lens) {
-      print STDERR "E: Failed to load lens $lens\n";
-      print STDERR $aug->print($err_lens_path);
+      $self->err_msg("Failed to load lens $lens");
+      $self->err_msg($aug->print($err_lens_path));
    }
 
    my $err_path = "/augeas/files$absfile/error";
    my $err = $aug->get($err_path);
    if ($err) {
-      print STDERR "E: Failed to parse file $file\n";
-      print STDERR $aug->print($err_path);
-      exit(1);
+      my $err_line_path = "/augeas/files$absfile/error/line";
+      my $err_line = $aug->get($err_line_path);
+      my $err_char_path = "/augeas/files$absfile/error/char";
+      my $err_char = $aug->get($err_char_path);
+
+      $self->err_msg("Failed to parse file $file");
+      my $err_msg = ($err eq "parse_failed") ?
+         "Parsing failed on line $err_line, character $err_char."
+         : $aug->print($err_path);
+      $self->die_msg($err_msg);
    }
+}
+
+sub confname {
+   my ($self) = @_;
+
+   assert_notempty('conffile', $self->{conffile});
+   my $confname = $self->{conffile};
+   $confname =~ s|.*/||;
+   return $confname;
+}
+
+
+sub print_msg {
+   my ($self, $msg, $level) = @_;
+
+   $level ||= "E";
+
+   my $confname = $self->confname();
+   print STDERR "$level:[$confname]: $msg\n";
+}
+
+sub err_msg {
+   my ($self, $msg) = @_;
+
+   $self->print_msg($msg, 'E');
+}
+
+sub die_msg {
+   my ($self, $msg) = @_;
+
+   $self->err_msg($msg);
+   exit(1) unless $self->{nofail};
+}
+
+sub verbose_msg {
+   my ($self, $msg) = @_;
+
+   $self->print_msg($msg, 'V') if $self->{verbose};
+}
+
+sub debug_msg {
+   my ($self, $msg) = @_;
+
+   $self->print_msg($msg, 'D') if $self->{debug};
+}
+
+sub info_msg {
+   my ($self, $msg) = @_;
+
+   $self->print_msg($msg, 'I') unless $self->{quiet};
 }
 
 
 sub play_rule {
    my ($self, $rule, $file) = @_;
 
-   die "E: Section '$rule' does not exist\n" unless $self->{cfg}->SectionExists($rule);
+   unless ($self->{cfg}->SectionExists($rule)) {
+      $self->die_msg("Section '$rule' does not exist");
+   }
    my $name = $self->{cfg}->val($rule, 'name');
    assert_notempty('name', $name);
    my $type = $self->{cfg}->val($rule, 'type');
@@ -182,10 +298,10 @@ sub play_rule {
 
 
 sub print_error {
-   my ($level, $file, $msg, $explanation) = @_;
+   my ($self, $level, $file, $msg, $explanation) = @_;
 
-   print STDERR "$level: File $file\n";
-   print STDERR "$level: $msg";
+   $self->print_msg("File $file", $level);
+   $self->print_msg($msg, $level);
    print STDERR "   $explanation.\n";
 }
 
@@ -196,18 +312,18 @@ sub assert {
    if ($type eq 'count') {
       my $count = $self->{aug}->count_match("$expr");
       if ($count != $value) {
-         my $msg = "Assertion '$name' of type $type returned $count for file $file, expected $value:\n";
+         my $msg = "Assertion '$name' of type $type returned $count for file $file, expected $value:";
          if ($level eq "error") {
-            print_error("E", $file, $msg, $explanation);
+            $self->print_error("E", $file, $msg, $explanation);
 	    $self->{err} = $self->{err_code};
          } elsif ($level eq "warning") {
-            print_error("W", $file, $msg, $explanation);
+            $self->print_error("W", $file, $msg, $explanation);
          } else {
-            die "E: Unknown level $level for assertion '$name'\n";
+            $self->die_msg("Unknown level $level for assertion '$name'");
          }
       }
    } else {
-      die "E: Unknown type '$type'\n";
+      $self->die_msg("Unknown type '$type'");
    }
 }
 
@@ -324,8 +440,8 @@ L<Config::Augeas>
 
 =head1 FILES
 
-F<augeas-validator.ini>
-    The default configuration file for B<Config::Augeas::Validator>.
+F</etc/augeas-validator/rules.d>
+    The default rules directory for B<Config::Augeas::Validator>.
 
 =cut
 

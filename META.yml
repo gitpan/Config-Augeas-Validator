@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               Config-Augeas-Validator
-version:            0.103
+version:            1.000
 abstract:           ~
 author:  []
 license:            unknown
