@@ -23,8 +23,9 @@ use base qw(Class::Accessor);
 use Config::Augeas qw(get count_match print);
 use Config::IniFiles;
 use File::Find;
+use Term::ANSIColor;
 
-our $VERSION = '1.000';
+our $VERSION = '1.100';
 
 sub new {
    my $class = shift;
@@ -91,6 +92,7 @@ sub play_one {
 
    # Get return error code
    $self->{err_code} = $self->{cfg}->val('DEFAULT', 'err_code') || 1;
+   $self->{warn_code} = $self->{cfg}->val('DEFAULT', 'warn_code') || 2;
 
    $self->init_augeas;
 
@@ -130,14 +132,13 @@ sub tick {
    my $tick = $self->{tick} % 4;
 
    my $hourglass; 
-   print "\r";
     
    $hourglass = "|"  if ( $tick == 0 ); 
    $hourglass = "/"  if ( $tick == 1 ); 
    $hourglass = "-"  if ( $tick == 2 ); 
    $hourglass = "\\" if ( $tick == 3 ); 
 
-   print "I: Recursively analyzing directories $hourglass\r";
+   print colored ($hourglass, "blue bold"),"\b";
 }
 
 sub play {
@@ -145,6 +146,8 @@ sub play {
 
    my @files;
    if ($self->{recurse}) {
+      printf "\033[?25l"; # hide cursor
+      print colored ("I: Recursively analyzing directories ", "blue bold") unless $self->{quiet};
       find sub {
          my $exclude = $self->{exclude};
          $exclude ||= '^$';
@@ -152,7 +155,8 @@ sub play {
             if(-e && $File::Find::name !~ /^$exclude$/);
          $self->tick unless $self->{quiet}
          }, @infiles;
-      print "\n" unless $self->{quiet};
+      print colored("[done]", "green bold"),"\n" unless $self->{quiet};
+      printf "\033[?25h"; # restore cursor
    } else {
       @files = @infiles;
    }
@@ -234,18 +238,19 @@ sub confname {
 
 
 sub print_msg {
-   my ($self, $msg, $level) = @_;
+   my ($self, $msg, $level, $color) = @_;
 
-   $level ||= "E";
+   $level ||= "I";
+   $color ||= "blue bold";
 
    my $confname = $self->confname();
-   print STDERR "$level:[$confname]: $msg\n";
+   print STDERR colored ("$level:[$confname]: $msg", $color),"\n";
 }
 
 sub err_msg {
    my ($self, $msg) = @_;
 
-   $self->print_msg($msg, 'E');
+   $self->print_msg($msg, 'E', 'red bold');
 }
 
 sub die_msg {
@@ -258,19 +263,19 @@ sub die_msg {
 sub verbose_msg {
    my ($self, $msg) = @_;
 
-   $self->print_msg($msg, 'V') if $self->{verbose};
+   $self->print_msg($msg, 'V', 'blue bold') if $self->{verbose};
 }
 
 sub debug_msg {
    my ($self, $msg) = @_;
 
-   $self->print_msg($msg, 'D') if $self->{debug};
+   $self->print_msg($msg, 'D', 'blue') if $self->{debug};
 }
 
 sub info_msg {
    my ($self, $msg) = @_;
 
-   $self->print_msg($msg, 'I') unless $self->{quiet};
+   $self->print_msg($msg, 'I', 'green bold') unless $self->{quiet};
 }
 
 
@@ -298,11 +303,11 @@ sub play_rule {
 
 
 sub print_error {
-   my ($self, $level, $file, $msg, $explanation) = @_;
+   my ($self, $level, $color, $file, $msg, $explanation) = @_;
 
-   $self->print_msg("File $file", $level);
-   $self->print_msg($msg, $level);
-   print STDERR "   $explanation.\n";
+   $self->print_msg("File $file", $level, $color);
+   $self->print_msg($msg, $level, $color);
+   print STDERR colored ("   $explanation.", $color),"\n";
 }
 
 
@@ -314,10 +319,11 @@ sub assert {
       if ($count != $value) {
          my $msg = "Assertion '$name' of type $type returned $count for file $file, expected $value:";
          if ($level eq "error") {
-            $self->print_error("E", $file, $msg, $explanation);
+            $self->print_error('E', 'red bold', $file, $msg, $explanation);
 	    $self->{err} = $self->{err_code};
          } elsif ($level eq "warning") {
-            $self->print_error("W", $file, $msg, $explanation);
+            $self->print_error('W', 'yellow bold', $file, $msg, $explanation);
+	    $self->{err} = $self->{warn_code};
          } else {
             $self->die_msg("Unknown level $level for assertion '$name'");
          }
