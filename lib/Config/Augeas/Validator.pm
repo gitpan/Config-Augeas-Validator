@@ -25,7 +25,53 @@ use Config::IniFiles;
 use File::Find;
 use Term::ANSIColor;
 
-our $VERSION = '1.110';
+our $VERSION = '1.200';
+
+# Constants from Augeas' internal.h
+use constant AUGEAS_META_TREE   => "/augeas";
+use constant AUGEAS_SPAN_OPTION => AUGEAS_META_TREE."/span";
+use constant AUGEAS_ENABLE      => "enable";
+use constant AUGEAS_DISABLE     => "disable";
+
+# Our constants
+use constant DEFAULT_RULESDIR => "/etc/augeas-validator/rules.d";
+
+use constant {
+   CONF_DEFAULT_SECTION => "DEFAULT",
+   CONF_ERR_CODE        => "err_code",
+   CONF_WARN_CODE       => "warn_code",
+   CONF_LENS            => "lens",
+   CONF_PATTERN         => "pattern",
+   CONF_EXCLUDE         => "exclude",
+   CONF_TAGS            => "tags",
+   CONF_LEVEL_ERR       => "error",
+   CONF_LEVEL_WARN      => "warning",
+   CONF_LEVEL_IGNORE    => "ignore",
+   CONF_TYPE_NAME       => "name",
+   CONF_TYPE_TYPE       => "type",
+   CONF_TYPE_COUNT      => "count",
+   CONF_TYPE_EXPR       => "expr",
+   CONF_TYPE_VALUE      => "value",
+   CONF_TYPE_EXPL       => "explanation",
+   CONF_TYPE_LEVEL      => "level",
+};
+ 
+
+# Output
+use constant {
+   COLOR_INFO           => "blue bold",
+   COLOR_VERBOSE        => "blue bold",
+   COLOR_OK             => "green bold",
+   COLOR_ERR            => "red bold",
+   COLOR_WARN           => "yellow bold",
+   COLOR_DEBUG          => "blue",
+   MSG_ERR              => "E",
+   MSG_WARN             => "W",
+   MSG_INFO             => "I",
+   MSG_VERBOSE          => "V",
+   MSG_DEBUG            => "D",
+};
+
 
 sub new {
    my $class = shift;
@@ -35,7 +81,7 @@ sub new {
 
    $self->{conffile} = $options{conf};
    $self->{rulesdir} = $options{rulesdir};
-   $self->{rulesdir} ||= "/etc/augeas-validator/rules.d";
+   $self->{rulesdir} ||= DEFAULT_RULESDIR;
 
    $self->{verbose} = $options{verbose};
    $self->{debug} = $options{debug};
@@ -48,6 +94,12 @@ sub new {
 
    $self->{exclude} = $options{exclude};
 
+   $self->{tags} = $options{tags};
+   $self->{tags} ||= [];
+
+   # System mode off by default
+   $self->{syswide} = 0;
+
    # Init hourglass
    $self->{tick} = 0;
 
@@ -55,7 +107,7 @@ sub new {
       assert_notempty('rulesdir', $self->{rulesdir});
    }
 
-   $self->{aug} = Config::Augeas->new( "no_load" => 1 );
+   $self->{aug} = Config::Augeas->new( "no_load" => 1, enable_span => 1 );
 
    # Instantiate general error
    $self->{err} = 0;
@@ -69,8 +121,8 @@ sub load_conf {
    $self->debug_msg("Loading rule file $conffile");
 
    $self->{cfg} = new Config::IniFiles( -file => $conffile );
-   die "E:[$conffile]: Section 'DEFAULT' does not exist.\n"
-      unless $self->{cfg}->SectionExists('DEFAULT');
+   die MSG_ERR.":[$conffile]: Section ".CONF_DEFAULT_SECTION." does not exist.\n"
+      unless $self->{cfg}->SectionExists(CONF_DEFAULT_SECTION);
 }
 
 
@@ -78,21 +130,23 @@ sub init_augeas {
    my ($self) = @_;
 
    # Initialize Augeas
-   $self->{lens} = $self->{cfg}->val('DEFAULT', 'lens');
+   $self->{lens} = $self->{cfg}->val(CONF_DEFAULT_SECTION, CONF_LENS);
    assert_notempty('lens', $self->{lens});
-   $self->{aug}->rm("/augeas/load/*[label() != \"$self->{lens}\"]");
+
+   if ($self->{syswide} != 1) {
+      $self->{aug}->rm(AUGEAS_META_TREE."/load/*[label() != \"$self->{lens}\"]");
+   }
 }
 
 sub play_one {
    my ($self, @files) = @_;
 
    # Get rules
-   @{$self->{rules}} = split(/,\s*/,
-                       $self->{cfg}->val('DEFAULT', 'rules'));
+   @{$self->{rules}} = grep { !/DEFAULT/ } $self->{cfg}->Sections;
 
    # Get return error code
-   $self->{err_code} = $self->{cfg}->val('DEFAULT', 'err_code') || 1;
-   $self->{warn_code} = $self->{cfg}->val('DEFAULT', 'warn_code') || 2;
+   $self->{err_code} = $self->{cfg}->val(CONF_DEFAULT_SECTION, CONF_ERR_CODE) || 1;
+   $self->{warn_code} = $self->{cfg}->val(CONF_DEFAULT_SECTION, CONF_WARN_CODE) || 2;
 
    $self->init_augeas;
 
@@ -112,14 +166,28 @@ sub play_one {
 sub filter_files {
    my ($self, $files) = @_;
 
-   my $pattern = $self->{cfg}->val('DEFAULT', 'pattern');
-   my $exclude = $self->{cfg}->val('DEFAULT', 'exclude');
-   $exclude ||= '^$';
-
    my @filtered_files;
-   foreach my $file (@$files) {
-      push @filtered_files, $file
-         if ($file =~ /^$pattern$/ && $file !~ /^$exclude$/);
+
+   if ($self->{syswide} == 1) {
+      my $lens = $self->{cfg}->val(CONF_DEFAULT_SECTION, CONF_LENS);
+      $self->debug_msg("Finding files for lens $lens");
+      my $sys_path = AUGEAS_META_TREE."/files//*[lens =~ regexp('@?${lens}(\.lns)?')]/path";
+      $self->debug_msg($sys_path);
+      for my $f ($self->{aug}->match($sys_path)) {
+         my $p = $self->{aug}->get($f);
+         $p =~ s|^/files||;
+         $self->debug_msg("Found file $p");
+         push @filtered_files, $p;
+      }
+   } else {
+      my $pattern = $self->{cfg}->val(CONF_DEFAULT_SECTION, CONF_PATTERN);
+      my $exclude = $self->{cfg}->val(CONF_DEFAULT_SECTION, CONF_EXCLUDE);
+      $exclude ||= '^$';
+
+      foreach my $file (@$files) {
+         push @filtered_files, $file
+            if ($file =~ /^$pattern$/ && $file !~ /^$exclude$/);
+      }
    }
 
    return \@filtered_files;
@@ -138,7 +206,22 @@ sub tick {
    $hourglass = "-"  if ( $tick == 2 ); 
    $hourglass = "\\" if ( $tick == 3 ); 
 
-   print colored ($hourglass, "blue bold"),"\b";
+   print colored ($hourglass, COLOR_INFO),"\b";
+}
+
+sub get_all_files {
+   my ($self) = @_;
+
+   my @files;
+
+   $self->{aug}->load();
+   for my $f ($self->{aug}->match(AUGEAS_META_TREE."/files//path[. != '']")) {
+      my $p = $self->{aug}->get($f);
+      $p =~ s|^/files||;
+      push @files, $p;
+   }
+
+   return @files;
 }
 
 sub play {
@@ -147,7 +230,7 @@ sub play {
    my @files;
    if ($self->{recurse}) {
       printf "\033[?25l"; # hide cursor
-      print colored ("I: Recursively analyzing directories ", "blue bold") unless $self->{quiet};
+      print colored ("I: Recursively analyzing directories ", COLOR_INFO) unless $self->{quiet};
       find sub {
          my $exclude = $self->{exclude};
          $exclude ||= '^$';
@@ -155,9 +238,12 @@ sub play {
             if(-e && $File::Find::name !~ /^$exclude$/);
          $self->tick unless $self->{quiet}
          }, @infiles;
-      print colored("[done]", "green bold"),"\n" unless $self->{quiet};
+      print colored("[done]", COLOR_OK),"\n" unless $self->{quiet};
       printf "\033[?25h"; # restore cursor
-   } else {
+   } elsif ($#infiles < 0) {
+      @files = $self->get_all_files();
+      $self->{syswide} = 1;
+   }else {
       @files = @infiles;
    }
    
@@ -167,12 +253,12 @@ sub play {
    } else {
       my $rulesdir = $self->{rulesdir};
       opendir (RULESDIR, $rulesdir)
-         or die "E: Could not open rules directory $rulesdir: $!\n";
+         or die MSG_ERR.": Could not open rules directory $rulesdir: $!\n";
       while (my $conffile = readdir(RULESDIR)) {
          next unless ($conffile =~ /.*\.ini$/);
          $self->{conffile} = "$rulesdir/$conffile";
          $self->load_conf($self->{conffile});
-         next unless ($self->{cfg}->val('DEFAULT', 'pattern'));
+         next unless ($self->{cfg}->val(CONF_DEFAULT_SECTION, CONF_PATTERN));
    
          my $filtered_files = $self->filter_files(\@files);
          my $elems = @$filtered_files;
@@ -195,28 +281,33 @@ sub set_aug_file {
    my $lens = $self->{lens};
 
 
-   if ($aug->count_match("/augeas/load/$lens/lens") == 0) {
-      # Lenses with no autoload xfm => bet on lns
-      $aug->set("/augeas/load/$lens/lens", "$lens.lns");
-   }
-   $aug->rm("/augeas/load/$lens/incl");
-   $aug->set("/augeas/load/$lens/incl", $absfile);
-   $aug->defvar('file', "/files$absfile");
-   $aug->load;
+   if ($self->{syswide} != 1) {
+      $aug->rm("/files");
+      if ($aug->count_match(AUGEAS_META_TREE."/load/$lens/lens") == 0) {
+         # Lenses with no autoload xfm => bet on lns
+         $aug->set(AUGEAS_META_TREE."/load/$lens/lens", "$lens.lns");
+      }
 
-   my $err_lens_path = "/augeas/load/$lens/error";
+      $aug->rm(AUGEAS_META_TREE."/load/$lens/incl");
+      $aug->set(AUGEAS_META_TREE."/load/$lens/incl", $absfile);
+      $aug->load;
+   }
+
+   $aug->defvar('file', "/files$absfile");
+
+   my $err_lens_path = AUGEAS_META_TREE."/load/$lens/error";
    my $err_lens = $aug->get($err_lens_path);
    if ($err_lens) {
       $self->err_msg("Failed to load lens $lens");
       $self->err_msg($aug->print($err_lens_path));
    }
 
-   my $err_path = "/augeas/files$absfile/error";
+   my $err_path = AUGEAS_META_TREE."/files$absfile/error";
    my $err = $aug->get($err_path);
    if ($err) {
-      my $err_line_path = "/augeas/files$absfile/error/line";
+      my $err_line_path = AUGEAS_META_TREE."/files$absfile/error/line";
       my $err_line = $aug->get($err_line_path);
-      my $err_char_path = "/augeas/files$absfile/error/char";
+      my $err_char_path = AUGEAS_META_TREE."/files$absfile/error/char";
       my $err_char = $aug->get($err_char_path);
 
       $self->err_msg("Failed to parse file $file");
@@ -240,8 +331,8 @@ sub confname {
 sub print_msg {
    my ($self, $msg, $level, $color) = @_;
 
-   $level ||= "I";
-   $color ||= "blue bold";
+   $level ||= MSG_INFO;
+   $color ||= COLOR_INFO;
 
    my $confname = $self->confname();
    print STDERR colored ("$level:[$confname]: $msg", $color),"\n";
@@ -250,7 +341,7 @@ sub print_msg {
 sub err_msg {
    my ($self, $msg) = @_;
 
-   $self->print_msg($msg, 'E', 'red bold');
+   $self->print_msg($msg, MSG_ERR, COLOR_ERR);
 }
 
 sub die_msg {
@@ -263,19 +354,19 @@ sub die_msg {
 sub verbose_msg {
    my ($self, $msg) = @_;
 
-   $self->print_msg($msg, 'V', 'blue bold') if $self->{verbose};
+   $self->print_msg($msg, MSG_VERBOSE, COLOR_VERBOSE) if $self->{verbose};
 }
 
 sub debug_msg {
    my ($self, $msg) = @_;
 
-   $self->print_msg($msg, 'D', 'blue') if $self->{debug};
+   $self->print_msg($msg, MSG_DEBUG, COLOR_DEBUG) if $self->{debug};
 }
 
-sub info_msg {
+sub ok_msg {
    my ($self, $msg) = @_;
 
-   $self->print_msg($msg, 'I', 'green bold') unless $self->{quiet};
+   $self->print_msg($msg, MSG_INFO, COLOR_OK) unless $self->{quiet};
 }
 
 
@@ -285,18 +376,40 @@ sub play_rule {
    unless ($self->{cfg}->SectionExists($rule)) {
       $self->die_msg("Section '$rule' does not exist");
    }
-   my $name = $self->{cfg}->val($rule, 'name');
-   assert_notempty('name', $name);
-   my $type = $self->{cfg}->val($rule, 'type');
-   assert_notempty('type', $type);
-   my $expr = $self->{cfg}->val($rule, 'expr');
-   assert_notempty('expr', $expr);
-   my $value = $self->{cfg}->val($rule, 'value');
-   assert_notempty('value', $value);
-   my $explanation = $self->{cfg}->val($rule, 'explanation');
+   my $name = $self->{cfg}->val($rule, CONF_TYPE_NAME);
+   assert_notempty(CONF_TYPE_NAME, $name);
+   my $type = $self->{cfg}->val($rule, CONF_TYPE_TYPE);
+   assert_notempty(CONF_TYPE_TYPE, $type);
+   my $expr = $self->{cfg}->val($rule, CONF_TYPE_EXPR);
+   assert_notempty(CONF_TYPE_EXPR, $expr);
+   my $value = $self->{cfg}->val($rule, CONF_TYPE_VALUE);
+   assert_notempty(CONF_TYPE_VALUE, $value);
+   my $explanation = $self->{cfg}->val($rule, CONF_TYPE_EXPL);
    $explanation ||= '';
-   my $level = $self->{cfg}->val($rule, 'level');
-   $level ||= 'error';
+   my $level = $self->{cfg}->val($rule, CONF_TYPE_LEVEL);
+   $level ||= CONF_LEVEL_ERR;
+
+   return if ($level eq CONF_LEVEL_IGNORE);
+
+   my @def_tags = @{$self->{tags}};
+   my $rule_tags_str = $self->{cfg}->val($rule, CONF_TAGS);
+   $rule_tags_str ||= '';
+   if ($#def_tags >= 0) {
+      $self->debug_msg("Defined tags for rule: $rule_tags_str");
+      my @rule_tags = split(',', $rule_tags_str);
+      my $tag_ok = 0;
+      for my $tag (@def_tags) {
+         if (grep(/^$tag$/, @rule_tags)) {
+            $self->debug_msg("Matched tag $tag for rule $rule");
+            $tag_ok = 1;
+            last;
+         }
+      }
+      unless ($tag_ok) {
+         $self->verbose_msg("Ignoring rule $rule since no tags matched");
+         return;
+      }
+   }
 
    $self->assert($name, $type, $expr, $value, $file, $explanation, $level);
 }
@@ -305,28 +418,61 @@ sub play_rule {
 sub print_error {
    my ($self, $level, $color, $file, $msg, $explanation) = @_;
 
-   $self->print_msg("File $file", $level, $color);
    $self->print_msg($msg, $level, $color);
    print STDERR colored ("   $explanation.", $color),"\n";
+}
+
+
+sub line_num {
+   my ($file, $position) = @_;
+   open my $fh, '<', "$file" || die MSG_ERR.": Failed to open file: $!";
+
+   my $cur_pos = 0;
+
+   while (<$fh>) {
+       if ($cur_pos < $position) {
+          $cur_pos += length $_; 
+       } else {
+          last;
+       }
+   }
+
+   return $.;
 }
 
 
 sub assert {
    my ($self, $name, $type, $expr, $value, $file, $explanation, $level) = @_;
 
-   if ($type eq 'count') {
+   if ($type eq CONF_TYPE_COUNT) {
       my $count = $self->{aug}->count_match("$expr");
       if ($count != $value) {
-         my $msg = "Assertion '$name' of type $type returned $count for file $file, expected $value:";
-         if ($level eq "error") {
-            $self->print_error('E', 'red bold', $file, $msg, $explanation);
+         my $mlevel;
+         my $mcolor;
+         if ($level eq CONF_LEVEL_ERR) {
+            $mlevel = MSG_ERR;
+            $mcolor = COLOR_ERR;
 	    $self->{err} = $self->{err_code};
-         } elsif ($level eq "warning") {
-            $self->print_error('W', 'yellow bold', $file, $msg, $explanation);
+         } elsif ($level eq CONF_LEVEL_WARN) {
+            $mlevel = MSG_WARN;
+            $mcolor = COLOR_WARN;
 	    $self->{err} = $self->{warn_code};
          } else {
             $self->die_msg("Unknown level $level for assertion '$name'");
          }
+         my $msg = "Assertion '$name' of type $type returned $count for file $file, expected $value.";
+
+         # Print span if value = 0
+         if ($value == 0) {
+            my @lines;
+            for my $node ($self->{aug}->match("$expr")) {
+               # FIXME: Catch aug_span errors to prevent erroneous values
+               my $span_start = $self->{aug}->span("$node")->{span_start};
+               push @lines, line_num($file, $span_start+1);
+            }
+            $msg .= "\n   Found $count bad node(s) on line(s): ".join(', ', @lines).".";
+         }
+         $self->print_error($mlevel, $mcolor, $file, $msg, $explanation);
       }
    } else {
       $self->die_msg("Unknown type '$type'");
@@ -337,7 +483,7 @@ sub assert {
 sub assert_notempty {
    my ($name, $var) = @_;
 
-   die "E: Variable '$name' should not be empty\n"
+   die MSG_ERR.": Variable '$name' should not be empty\n"
       unless (defined($var)); 
 }
 
@@ -372,12 +518,6 @@ The B<Config::Augeas::Validator> configuration files are INI files.
 The B<DEFAULT> section is mandatory. It contains the following variables:
 
 =over 8
-
-=item B<rules>
-
-The ordered list of the rules to run, separated with commas, for example:
-
-C<rules=app_type, ai_bo_auth, dr_auth>
 
 =item B<lens>
 
@@ -434,6 +574,7 @@ C<value=1>
 The importance level of the test. Possible values are 'error' (default) and 'warning'.
 When set to 'error', a failed test will interrupt the processing and set the return code.
 When set to 'warning', a failed test will display a warning, continue, and have no effect on the return code.
+When set to 'ignore', the test is ignored and never run.
 
 C<level=warning>
 
