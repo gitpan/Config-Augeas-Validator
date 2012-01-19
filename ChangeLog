@@ -1,3 +1,7 @@
+2012-01-19  Raphaël Pinson <raphink@cpan.org> v1.300
+
+	* Allow multiple rulesdirs.
+
 2011-10-11  Raphaël Pinson <raphink@cpan.org> v1.200
 
 	* Remove rules parameter, add level=ignore;

@@ -1,6 +1,6 @@
 ---
 name: Config-Augeas-Validator
-version: 1.200
+version: 1.300
 author:
   - 'RaphaÃ«l Pinson <raphink@cpan.org>'
 abstract: A generic configuration validator API
@@ -19,7 +19,7 @@ configure_requires:
 provides:
   Config::Augeas::Validator:
     file: lib/Config/Augeas/Validator.pm
-    version: 1.200
+    version: 1.300
 generated_by: Module::Build version 0.340201
 meta-spec:
   url: http://module-build.sourceforge.net/META-spec-v1.4.html

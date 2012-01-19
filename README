@@ -10,6 +10,9 @@ SYNOPSIS
        $validator->play(@files);
        exit $validator->{err};
 
+    $rulesdir points to one or more directories of rules, separated by
+    colons.
+
 CONFIGURATION
     The Config::Augeas::Validator configuration files are INI files.
 

@@ -25,7 +25,7 @@ use Config::IniFiles;
 use File::Find;
 use Term::ANSIColor;
 
-our $VERSION = '1.200';
+our $VERSION = '1.300';
 
 # Constants from Augeas' internal.h
 use constant AUGEAS_META_TREE   => "/augeas";
@@ -251,22 +251,24 @@ sub play {
       $self->load_conf($self->{conffile});
       $self->play_one(@files);
    } else {
-      my $rulesdir = $self->{rulesdir};
-      opendir (RULESDIR, $rulesdir)
-         or die MSG_ERR.": Could not open rules directory $rulesdir: $!\n";
-      while (my $conffile = readdir(RULESDIR)) {
-         next unless ($conffile =~ /.*\.ini$/);
-         $self->{conffile} = "$rulesdir/$conffile";
-         $self->load_conf($self->{conffile});
-         next unless ($self->{cfg}->val(CONF_DEFAULT_SECTION, CONF_PATTERN));
-   
-         my $filtered_files = $self->filter_files(\@files);
-         my $elems = @$filtered_files;
-         next unless ($elems > 0);
-   
-         $self->play_one(@$filtered_files);
+      my @rulesdirs = split(/:/, $self->{rulesdir});
+      foreach my $rulesdir (@rulesdirs) {
+	 opendir (RULESDIR, $rulesdir)
+	    or die MSG_ERR.": Could not open rules directory $rulesdir: $!\n";
+	 while (my $conffile = readdir(RULESDIR)) {
+	    next unless ($conffile =~ /.*\.ini$/);
+	    $self->{conffile} = "$rulesdir/$conffile";
+	    $self->load_conf($self->{conffile});
+	    next unless ($self->{cfg}->val(CONF_DEFAULT_SECTION, CONF_PATTERN));
+
+	    my $filtered_files = $self->filter_files(\@files);
+	    my $elems = @$filtered_files;
+	    next unless ($elems > 0);
+
+	    $self->play_one(@$filtered_files);
+	 }
+	 closedir(RULESDIR);
       }
-      closedir(RULESDIR);
    }
 }
 
@@ -465,12 +467,18 @@ sub assert {
          # Print span if value = 0
          if ($value == 0) {
             my @lines;
+            my $got_span = 0;
             for my $node ($self->{aug}->match("$expr")) {
-               # FIXME: Catch aug_span errors to prevent erroneous values
-               my $span_start = $self->{aug}->span("$node")->{span_start};
-               push @lines, line_num($file, $span_start+1);
+               if ($self->{aug}->span($node)->{filename}) {
+                  my $span_start = $self->{aug}->span($node)->{span_start};
+                  push @lines, line_num($file, $span_start);
+                  $got_span = 1;
+               } else {
+                  $self->debug_msg("No span information for node $node");
+               }
             }
-            $msg .= "\n   Found $count bad node(s) on line(s): ".join(', ', @lines).".";
+            $msg .= "\n   Found $count bad node(s) on line(s): ".join(', ', @lines)."."
+               if $got_span;
          }
          $self->print_error($mlevel, $mcolor, $file, $msg, $explanation);
       }
@@ -507,6 +515,9 @@ __END__
 
    $validator->play(@files);
    exit $validator->{err};
+
+
+$rulesdir points to one or more directories of rules, separated by colons.
 
 
 =head1 CONFIGURATION
